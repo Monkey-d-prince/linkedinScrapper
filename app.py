@@ -13,6 +13,7 @@ from threading import Thread
 from flask_cors import CORS
 from flask import Flask, request, jsonify, send_from_directory
 import platform
+import webbrowser
 
 app = Flask(__name__, static_folder="static")
 CORS(app)  # Enable CORS for all routes
@@ -163,11 +164,19 @@ def manual_login():
     # Create a visible browser window
     driver = setup_driver(headless=False)
     driver.get('https://www.linkedin.com/login')
+    
+    # Display the remote debugging URL prominently
+    print("\n" + "="*80)
+    print("🌐 REMOTE ACCESS INSTRUCTIONS 🌐")
+    print(f"Open this URL in your browser: http://{74.225.249.58}:9222")
+    print("Then click on the '_blank' or 'LinkedIn Login' link to access the login page")
+    print("="*80 + "\n")
+    
     print(f"Current page title: {driver.title}")
     
     # Display clear instructions for the user
     print("\n📱 LINKEDIN LOGIN & VERIFICATION GUIDE 📱")
-    print("1. Enter your LinkedIn credentials in the browser window that just opened.")
+    print("1. Enter your LinkedIn credentials in the remote browser window.")
     print("2. LinkedIn may ask for additional verification via:")
     print("   - Email code")
     print("   - SMS code")
@@ -184,7 +193,16 @@ def manual_login():
     check_interval = 3  # Check every 3 seconds
     verification_warning_shown = False
     
+    # Periodically remind user about the remote debugging URL
+    reminder_interval = 60  # Show reminder every 60 seconds
+    last_reminder = 0
+    
     while wait_time < max_wait_time:
+        # Show periodic reminders about remote debugging URL
+        if wait_time - last_reminder >= reminder_interval:
+            print(f"\nREMINDER: Remote debugging available at http://{74.225.249.58}:9222")
+            last_reminder = wait_time
+            
         # Check if we're logged in
         try:
             current_url = driver.current_url
@@ -195,7 +213,8 @@ def manual_login():
                 if not verification_warning_shown:
                     print("\n🔐 VERIFICATION DETECTED 🔐")
                     print("LinkedIn is asking for additional verification.")
-                    print("Please complete the verification process in the browser window.")
+                    print("Please complete the verification process in the remote browser.")
+                    print(f"Remote browser access: http://{74.225.249.58}:9222")
                     verification_warning_shown = True
                     
                 # Show timer for verification
@@ -228,6 +247,7 @@ def manual_login():
             
         except Exception as e:
             print(f"Error checking login status: {e}")
+            print(f"You can still access the browser at http://{74.225.249.58}:9222")
             sleep(check_interval)
             wait_time += check_interval
     
@@ -247,9 +267,11 @@ def manual_login():
             return True
     except Exception as e:
         print(f"Error in final login check: {e}")
+        print(f"You can still access the browser at http://{74.225.249.58}:9222")
     
     # If we get here, login timed out or failed
     print("❌ Timed out or failed waiting for login")
+    print(f"You can still try accessing the browser manually at http://{74.225.249.58}:9222")
     if driver:
         driver.quit()
         driver = None
@@ -783,6 +805,17 @@ def scrape_company(company_url):
         is_scraping = False
         current_job = None
 
+# Add this function to open a URL in the default browser
+def open_browser_url(url):
+    """Open a URL in the default web browser"""
+    try:
+        print(f"Attempting to open URL in browser: {url}")
+        webbrowser.open(url)
+        return True
+    except Exception as e:
+        print(f"Error opening browser: {e}")
+        return False
+
 # API Routes
 @app.route('/status', methods=['GET'])
 def status():
@@ -892,6 +925,13 @@ def company_endpoint():
             
             if not is_logged_in or not driver:
                 print("LinkedIn login required before scraping")
+                
+                # Open the remote debugging URL before starting the login process
+                vm_ip = "74.225.249.58"  # Hardcoded VM IP address
+                debugging_url = f"http://{vm_ip}:9222"
+                print(f"Opening remote debugging URL: {debugging_url}")
+                open_browser_url(debugging_url)
+                
                 login_success = manual_login()
                 if not login_success:
                     error_msg = "Failed to log in to LinkedIn. Please try running the scraper again."
