@@ -8,10 +8,9 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
 from selenium.common.exceptions import NoSuchElementException, WebDriverException
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, render_template_string
 from threading import Thread
 from flask_cors import CORS
-from flask import Flask, request, jsonify, send_from_directory
 import platform
 import logging
 
@@ -31,6 +30,418 @@ is_scraping = False
 current_job = None
 job_results = {}
 cookies_jar = None  # Store LinkedIn cookies here
+
+# HTML template for remote login page
+REMOTE_LOGIN_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LinkedIn Remote Login Helper</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            line-height: 1.6;
+        }
+        h1, h2 {
+            color: #0077b5; /* LinkedIn blue */
+        }
+        .container {
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+        .step {
+            background-color: #f3f6f8;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 10px;
+        }
+        .step h2 {
+            margin-top: 0;
+        }
+        button {
+            background-color: #0077b5;
+            color: white;
+            border: none;
+            padding: 10px 15px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        button:hover {
+            background-color: #005e93;
+        }
+        button:disabled {
+            background-color: #ccc;
+            cursor: not-allowed;
+        }
+        input[type="text"] {
+            width: 100%;
+            padding: 8px;
+            font-size: 16px;
+            margin: 5px 0;
+        }
+        textarea {
+            width: 100%;
+            height: 200px;
+            padding: 8px;
+            font-family: monospace;
+            font-size: 14px;
+        }
+        .output {
+            background-color: #f0f0f0;
+            padding: 10px;
+            border-radius: 4px;
+            margin: 10px 0;
+            font-family: monospace;
+            white-space: pre-wrap;
+        }
+        .success {
+            background-color: #e6f7e6;
+            color: #28a745;
+            padding: 10px;
+            border-radius: 4px;
+            margin: 10px 0;
+        }
+        .error {
+            background-color: #f8d7da;
+            color: #dc3545;
+            padding: 10px;
+            border-radius: 4px;
+            margin: 10px 0;
+        }
+        .hidden {
+            display: none;
+        }
+        code {
+            background-color: #f0f0f0;
+            padding: 2px 4px;
+            border-radius: 3px;
+        }
+    </style>
+</head>
+<body>
+    <h1>LinkedIn Remote Login Helper</h1>
+    <p>This tool helps you log in to LinkedIn on your own computer and send the session cookies to this server.</p>
+
+    <div class="container">
+        <div class="step">
+            <h2>Step 1: Check Server Status</h2>
+            <button id="check-server">Check Server Status</button>
+            <div id="server-status"></div>
+        </div>
+
+        <div class="step">
+            <h2>Step 2: Log in to LinkedIn</h2>
+            <p>Click the button below to open LinkedIn in a new tab. Log in with your credentials and make sure you complete any verification steps until you see your feed.</p>
+            <button id="open-linkedin">Open LinkedIn</button>
+        </div>
+
+        <div class="step">
+            <h2>Step 3: Extract LinkedIn Cookies</h2>
+            <p>After you've logged in to LinkedIn, follow these steps to extract your cookies:</p>
+            <ol>
+                <li>Right-click anywhere on the LinkedIn page and select <strong>Inspect</strong> to open Developer Tools</li>
+                <li>Go to the <strong>Console</strong> tab</li>
+                <li>Copy and paste this command into the console:</li>
+            </ol>
+            <div class="output">JSON.stringify(
+  document.cookie.split('; ')
+  .map(c => {
+    const [name, ...value] = c.split('=');
+    return {name, value: value.join('=')}; 
+  })
+)</div>
+            <button id="copy-command">Copy Command</button>
+            <p>The console will output a long text with your cookies. Copy that entire output and paste it below:</p>
+            <textarea id="cookies-input" placeholder="Paste the cookies JSON here..."></textarea>
+            <div id="cookies-status" class="hidden"></div>
+        </div>
+
+        <div class="step">
+            <h2>Step 4: Send Cookies to Server</h2>
+            <p>Click the button below to send your LinkedIn cookies to the server:</p>
+            <button id="send-cookies" disabled>Send Cookies to Server</button>
+            <div id="send-status" class="hidden"></div>
+        </div>
+
+        <div class="step">
+            <h2>Step 5: Start Scraping</h2>
+            <p>Once your cookies have been successfully sent, you can start scraping a company:</p>
+            <label for="company-url">LinkedIn Company URL:</label>
+            <input type="text" id="company-url" placeholder="https://www.linkedin.com/company/example">
+            <button id="start-scraping" disabled>Start Scraping</button>
+            <div id="scrape-status" class="hidden"></div>
+        </div>
+    </div>
+
+    <script>
+        // Elements
+        const checkServerBtn = document.getElementById('check-server');
+        const serverStatus = document.getElementById('server-status');
+        const openLinkedInBtn = document.getElementById('open-linkedin');
+        const cookiesInput = document.getElementById('cookies-input');
+        const cookiesStatus = document.getElementById('cookies-status');
+        const sendCookiesBtn = document.getElementById('send-cookies');
+        const sendStatus = document.getElementById('send-status');
+        const companyUrlInput = document.getElementById('company-url');
+        const startScrapingBtn = document.getElementById('start-scraping');
+        const scrapeStatus = document.getElementById('scrape-status');
+        const copyCommandBtn = document.getElementById('copy-command');
+
+        // Copy command to clipboard
+        copyCommandBtn.addEventListener('click', () => {
+            const command = `JSON.stringify(
+  document.cookie.split('; ')
+  .map(c => {
+    const [name, ...value] = c.split('=');
+    return {name, value: value.join('=')}; 
+  })
+)`;
+            navigator.clipboard.writeText(command)
+                .then(() => {
+                    copyCommandBtn.textContent = 'Copied!';
+                    setTimeout(() => {
+                        copyCommandBtn.textContent = 'Copy Command';
+                    }, 2000);
+                })
+                .catch(err => {
+                    console.error('Failed to copy command:', err);
+                    alert('Failed to copy. Please select and copy the command manually.');
+                });
+        });
+
+        // Check server status
+        checkServerBtn.addEventListener('click', async () => {
+            try {
+                serverStatus.textContent = 'Checking server status...';
+                serverStatus.className = '';
+                
+                const response = await fetch('/status', {
+                    method: 'GET',
+                    headers: {
+                        'Accept': 'application/json'
+                    }
+                });
+                
+                const data = await response.json();
+                
+                if (response.ok) {
+                    if (data.logged_in) {
+                        serverStatus.className = 'success';
+                        serverStatus.textContent = 'Success! Server is running and already logged in to LinkedIn.';
+                        startScrapingBtn.disabled = false;
+                    } else {
+                        serverStatus.className = 'success';
+                        serverStatus.textContent = 'Success! Server is running but not logged in to LinkedIn.';
+                    }
+                } else {
+                    serverStatus.className = 'error';
+                    serverStatus.textContent = `Error contacting server: ${data.message || 'Unknown error'}`;
+                }
+            } catch (error) {
+                serverStatus.className = 'error';
+                serverStatus.textContent = `Error connecting to server: ${error.message}`;
+            }
+        });
+
+        // Open LinkedIn
+        openLinkedInBtn.addEventListener('click', () => {
+            window.open('https://www.linkedin.com/login', '_blank');
+        });
+
+        // Validate cookies input
+        cookiesInput.addEventListener('input', () => {
+            const cookiesText = cookiesInput.value.trim();
+            if (cookiesText) {
+                try {
+                    const cookies = JSON.parse(cookiesText);
+                    if (Array.isArray(cookies) && cookies.length > 0) {
+                        cookiesStatus.textContent = `✓ Valid cookies format. Found ${cookies.length} cookies.`;
+                        cookiesStatus.className = 'success';
+                        sendCookiesBtn.disabled = false;
+                    } else {
+                        cookiesStatus.textContent = '✗ Invalid cookies format. Should be an array.';
+                        cookiesStatus.className = 'error';
+                        sendCookiesBtn.disabled = true;
+                    }
+                } catch (e) {
+                    cookiesStatus.textContent = `✗ Invalid JSON format: ${e.message}`;
+                    cookiesStatus.className = 'error';
+                    sendCookiesBtn.disabled = true;
+                }
+                cookiesStatus.classList.remove('hidden');
+            } else {
+                cookiesStatus.classList.add('hidden');
+                sendCookiesBtn.disabled = true;
+            }
+        });
+
+        // Send cookies to server
+        sendCookiesBtn.addEventListener('click', async () => {
+            const cookiesText = cookiesInput.value.trim();
+            
+            if (!cookiesText) {
+                sendStatus.textContent = 'Please enter cookies';
+                sendStatus.className = 'error';
+                sendStatus.classList.remove('hidden');
+                return;
+            }
+            
+            try {
+                const cookies = JSON.parse(cookiesText);
+                
+                sendStatus.textContent = 'Sending cookies to server...';
+                sendStatus.className = '';
+                sendStatus.classList.remove('hidden');
+                
+                const response = await fetch('/submit-session', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Accept': 'application/json'
+                    },
+                    body: JSON.stringify({ cookies })
+                });
+                
+                const data = await response.json();
+                
+                if (response.ok && data.status === 'success') {
+                    sendStatus.textContent = 'Success! Cookies sent and login verified.';
+                    sendStatus.className = 'success';
+                    startScrapingBtn.disabled = false;
+                } else {
+                    sendStatus.textContent = `Error: ${data.message || 'Failed to send cookies'}`;
+                    sendStatus.className = 'error';
+                }
+            } catch (error) {
+                sendStatus.textContent = `Error: ${error.message}`;
+                sendStatus.className = 'error';
+            }
+        });
+
+        // Start scraping
+        startScrapingBtn.addEventListener('click', async () => {
+            const companyUrl = companyUrlInput.value.trim();
+            
+            if (!companyUrl) {
+                scrapeStatus.textContent = 'Please enter a LinkedIn company URL';
+                scrapeStatus.className = 'error';
+                scrapeStatus.classList.remove('hidden');
+                return;
+            }
+            
+            try {
+                scrapeStatus.textContent = 'Starting scraping job...';
+                scrapeStatus.className = '';
+                scrapeStatus.classList.remove('hidden');
+                
+                const response = await fetch(`/company?url=${encodeURIComponent(companyUrl)}`, {
+                    method: 'GET',
+                    headers: {
+                        'Accept': 'application/json'
+                    }
+                });
+                
+                const data = await response.json();
+                
+                if (response.ok && data.status === 'started') {
+                    scrapeStatus.innerHTML = `
+                        <p>✓ Scraping job started successfully!</p>
+                        <p>${data.message}</p>
+                        <p>Scraping will continue on the server. You can check for results by calling:</p>
+                        <code>/results?url=${encodeURIComponent(companyUrl)}</code>
+                    `;
+                    scrapeStatus.className = 'success';
+                    
+                    // Start polling for results
+                    pollForResults(companyUrl);
+                } else {
+                    scrapeStatus.textContent = `Error: ${data.message || 'Failed to start scraping'}`;
+                    scrapeStatus.className = 'error';
+                }
+            } catch (error) {
+                scrapeStatus.textContent = `Error: ${error.message}`;
+                scrapeStatus.className = 'error';
+            }
+        });
+        
+        // Poll for results
+        async function pollForResults(companyUrl) {
+            let attempts = 0;
+            const maxAttempts = 30; // 5 minutes (10 second intervals)
+            
+            const checkResults = async () => {
+                attempts++;
+                if (attempts > maxAttempts) {
+                    const statusHtml = scrapeStatus.innerHTML;
+                    scrapeStatus.innerHTML = statusHtml + '<p>Polling stopped after 5 minutes. The job may still be running on the server.</p>';
+                    return;
+                }
+                
+                try {
+                    // First check if scraping is still active
+                    const statusResponse = await fetch('/status');
+                    const statusData = await statusResponse.json();
+                    
+                    if (!statusData.is_scraping) {
+                        // If not scraping, check for results
+                        const resultsResponse = await fetch(`/results?url=${encodeURIComponent(companyUrl)}`);
+                        
+                        if (resultsResponse.ok) {
+                            const resultsData = await resultsResponse.json();
+                            
+                            if (resultsData.status === 'success') {
+                                scrapeStatus.innerHTML = `
+                                    <p>✓ Scraping completed successfully!</p>
+                                    <p>Company: ${resultsData.company_name || 'Unknown'}</p>
+                                    <p>Personnel found: ${resultsData.personnel_count || 0}</p>
+                                    <p>Check the full results at:</p>
+                                    <code>/results?url=${encodeURIComponent(companyUrl)}</code>
+                                `;
+                                return;
+                            } else if (resultsData.status === 'error') {
+                                scrapeStatus.innerHTML = `
+                                    <p>✗ Scraping failed: ${resultsData.message || 'Unknown error'}</p>
+                                `;
+                                return;
+                            }
+                        }
+                    }
+                    
+                    // Update status message
+                    scrapeStatus.innerHTML = `
+                        <p>Scraping in progress... (${attempts}/${maxAttempts})</p>
+                        <p>This may take several minutes. You can leave this page open to monitor progress.</p>
+                    `;
+                    
+                    // Continue polling
+                    setTimeout(checkResults, 10000);
+                    
+                } catch (error) {
+                    console.error('Error polling for results:', error);
+                    // Continue polling despite errors
+                    setTimeout(checkResults, 10000);
+                }
+            };
+            
+            // Start polling
+            setTimeout(checkResults, 5000);
+        }
+        
+        // Initialize - check server on load
+        document.addEventListener('DOMContentLoaded', () => {
+            checkServerBtn.click();
+        });
+    </script>
+</body>
+</html>
+"""
 
 def setup_driver(headless=False):
     """Set up and return a WebDriver instance for any available browser"""
@@ -895,10 +1306,10 @@ def login():
             "message": f"Error during login: {str(e)}"
         }), 500
 
-# New Remote Login Endpoints
+# Remote Login Interface
 @app.route('/remote-login', methods=['GET'])
 def remote_login():
-    """Return login URL for frontend to handle login"""
+    """Show the remote login page"""
     global is_logged_in
     
     if is_logged_in:
@@ -907,11 +1318,7 @@ def remote_login():
             "message": "Already logged in to LinkedIn"
         })
     
-    return jsonify({
-        "status": "ready_for_login",
-        "login_url": "https://www.linkedin.com/login",
-        "message": "Please log in to LinkedIn in your browser, then submit your session cookies."
-    })
+    return render_template_string(REMOTE_LOGIN_HTML)
 
 @app.route('/submit-session', methods=['POST'])
 def submit_session():
@@ -958,16 +1365,6 @@ def submit_session():
             "status": "error",
             "message": f"Error processing cookies: {str(e)}"
         }), 500
-
-@app.route('/remote-login-check', methods=['GET'])
-def remote_login_check():
-    """Check if remote login was successful"""
-    global is_logged_in
-    
-    return jsonify({
-        "status": "success" if is_logged_in else "not_logged_in",
-        "logged_in": is_logged_in
-    })
 
 @app.route('/company', methods=['GET'])
 def company_endpoint():
@@ -1110,7 +1507,7 @@ def company_endpoint():
     # Check if remote login is needed
     login_message = "A browser window will open for you to log in to LinkedIn manually. Please complete any verification steps LinkedIn requires."
     if not is_logged_in and cookies_jar is None:
-        login_message = "Please log in using the /remote-login endpoint first, then retry this request."
+        login_message = "Please use the /remote-login page first to log in to LinkedIn, then retry this request."
     
     return jsonify({
         "status": "started",
@@ -1309,7 +1706,12 @@ def serve(path):
     if path != "" and os.path.exists("static/" + path):
         return send_from_directory("static", path)
     else:
-        return send_from_directory("static", "index.html")
+        # Redirect to remote login if not logged in
+        global is_logged_in
+        if not is_logged_in:
+            return remote_login()
+        else:
+            return send_from_directory("static", "index.html")
 
 # Start the Flask server when run directly
 if __name__ == '__main__':
@@ -1317,11 +1719,6 @@ if __name__ == '__main__':
         # Create necessary directories
         os.makedirs("data", exist_ok=True)
         os.makedirs("static", exist_ok=True)  # Ensure static directory exists
-        
-        # Create a basic index.html if it doesn't exist
-        if not os.path.exists("static/index.html"):
-            with open("static/index.html", "w") as f:
-                f.write("<html><body><h1>LinkedIn Company Scraper</h1><p>Use the API endpoints to interact with the scraper.</p></body></html>")
         
         # Start the Flask server
         logger.info("Starting LinkedIn Company Scraper...")
