@@ -13,6 +13,13 @@ from threading import Thread
 from flask_cors import CORS
 from flask import Flask, request, jsonify, send_from_directory
 import platform
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, 
+                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+                    handlers=[logging.FileHandler("scraper.log"), logging.StreamHandler()])
+logger = logging.getLogger("linkedin-scraper")
 
 app = Flask(__name__, static_folder="static")
 CORS(app)  # Enable CORS for all routes
@@ -23,6 +30,7 @@ is_logged_in = False
 is_scraping = False
 current_job = None
 job_results = {}
+cookies_jar = None  # Store LinkedIn cookies here
 
 def setup_driver(headless=False):
     """Set up and return a WebDriver instance for any available browser"""
@@ -31,7 +39,7 @@ def setup_driver(headless=False):
     import platform
     
     system = platform.system()  # Windows, Darwin (macOS), or Linux
-    print(f"Detected operating system: {system}")
+    logger.info(f"Detected operating system: {system}")
 
     # Set common arguments
     browser_options = {
@@ -54,7 +62,7 @@ def setup_driver(headless=False):
     
     for browser_name in browsers:
         try:
-            print(f"Attempting to use {browser_name.capitalize()} browser...")
+            logger.info(f"Attempting to use {browser_name.capitalize()} browser...")
             
             if browser_name == "chrome":
                 options = webdriver.ChromeOptions()
@@ -83,11 +91,11 @@ def setup_driver(headless=False):
             else:
                 continue  # Skip unsupported browsers
             
-            print(f"Successfully initialized {browser_name.capitalize()} browser")
+            logger.info(f"Successfully initialized {browser_name.capitalize()} browser")
             return driver
         
         except (WebDriverException, Exception) as e:
-            print(f"{browser_name.capitalize()} browser not available: {e}")
+            logger.error(f"{browser_name.capitalize()} browser not available: {e}")
     
     # If we get here, no browser was available
     raise Exception("No compatible browser found. Please ensure Chrome, Firefox, Edge, or Safari is installed with the corresponding WebDriver.")
@@ -97,7 +105,7 @@ def switch_to_headless():
     global driver, is_logged_in
     
     if not driver or not is_logged_in:
-        print("No active driver to switch to headless mode")
+        logger.warning("No active driver to switch to headless mode")
         return False
     
     try:
@@ -105,7 +113,7 @@ def switch_to_headless():
         cookies = driver.get_cookies()
         current_url = driver.current_url
         
-        print("Switching to headless mode...")
+        logger.info("Switching to headless mode...")
         
         # Save the current window handle to restore later if needed
         original_window = driver.current_window_handle
@@ -122,7 +130,7 @@ def switch_to_headless():
             try:
                 headless_driver.add_cookie(cookie)
             except Exception as e:
-                print(f"Warning: Could not add cookie {cookie.get('name')}: {e}")
+                logger.warning(f"Could not add cookie {cookie.get('name')}: {e}")
         
         # Navigate to the same page the user was on
         headless_driver.get(current_url)
@@ -130,7 +138,7 @@ def switch_to_headless():
         
         # Verify we're still logged in
         if "feed" in headless_driver.current_url or not headless_driver.find_elements(By.ID, 'username'):
-            print("Successfully switched to headless mode while maintaining login session")
+            logger.info("Successfully switched to headless mode while maintaining login session")
             
             # Close the original visible browser
             driver.quit()
@@ -139,40 +147,83 @@ def switch_to_headless():
             driver = headless_driver
             return True
         else:
-            print("Failed to maintain login session in headless mode")
+            logger.error("Failed to maintain login session in headless mode")
             headless_driver.quit()
             return False
     except Exception as e:
-        print(f"Error switching to headless mode: {e}")
+        logger.error(f"Error switching to headless mode: {e}")
+        return False
+
+def cookie_login():
+    """Log in using cookies previously obtained from the user"""
+    global driver, is_logged_in, cookies_jar
+    
+    if not cookies_jar:
+        logger.error("No cookies available to use for login")
+        return False
+    
+    try:
+        logger.info("Attempting to log in using cookies...")
+        
+        # Create a new headless driver
+        driver = setup_driver(headless=True)
+        
+        # Navigate to LinkedIn
+        driver.get("https://www.linkedin.com")
+        
+        # Add all cookies
+        for cookie in cookies_jar:
+            try:
+                driver.add_cookie(cookie)
+            except Exception as e:
+                logger.warning(f"Could not add cookie {cookie.get('name')}: {e}")
+        
+        # Navigate to the feed to verify login
+        driver.get("https://www.linkedin.com/feed/")
+        sleep(2)
+        
+        # Verify we're logged in
+        if "feed" in driver.current_url or not driver.find_elements(By.ID, 'username'):
+            logger.info("Successfully logged in with cookies")
+            is_logged_in = True
+            return True
+        else:
+            logger.error("Cookie login failed - session may have expired")
+            if driver:
+                driver.quit()
+                driver = None
+            return False
+    except Exception as e:
+        logger.error(f"Error during cookie login: {e}")
         return False
 
 def manual_login():
     """Present a browser window for the user to manually log in to LinkedIn with verification guidance"""
     global driver, is_logged_in
     
-    print("\n" + "="*80)
-    print("STARTING LINKEDIN MANUAL LOGIN PROCESS")
-    print("="*80)
+    logger.info("\n" + "="*80)
+    logger.info("STARTING LINKEDIN MANUAL LOGIN PROCESS")
+    logger.info("="*80)
     
-    print("Opening browser for manual login...")
+    logger.info("Opening browser for manual login...")
     
     # Create a visible browser window
     driver = setup_driver(headless=False)
     driver.get('https://www.linkedin.com/login')
-    print(f"Current page title: {driver.title}")
+    logger.info(f"Current page title: {driver.title}")
     
     # Display clear instructions for the user
-    print("\n📱 LINKEDIN LOGIN & VERIFICATION GUIDE 📱")
-    print("1. Enter your LinkedIn credentials in the browser window that just opened.")
-    print("2. LinkedIn may ask for additional verification via:")
-    print("   - Email code")
-    print("   - SMS code")
-    print("   - LinkedIn mobile app approval")
-    print("3. Complete ALL verification steps until you see your LinkedIn feed.")
-    print("4. DO NOT close the browser window.")
+    logger.info("\n📱 LINKEDIN LOGIN & VERIFICATION GUIDE 📱")
+    logger.info("1. Enter your LinkedIn credentials in the browser window that just opened.")
+    logger.info("2. LinkedIn may ask for additional verification via:")
+    logger.info("   - Email code")
+    logger.info("   - SMS code")
+    logger.info("   - LinkedIn mobile app approval")
+    logger.info("3. Complete ALL verification steps until you see your LinkedIn feed.")
+    logger.info("4. DO NOT close the browser window.")
     
     # Wait for user confirmation before proceeding
-    print("\n⚠️ IMPORTANT: DO NOT CONTINUE UNTIL VERIFICATION IS COMPLETE ⚠️")
+    logger.info("\n⚠️ IMPORTANT: DO NOT CONTINUE UNTIL VERIFICATION IS COMPLETE ⚠️")
     
     # Wait for the user to log in manually (up to 5 minutes)
     wait_time = 0
@@ -184,68 +235,77 @@ def manual_login():
         # Check if we're logged in
         try:
             current_url = driver.current_url
-            print(f"Current URL: {current_url}")
+            logger.info(f"Current URL: {current_url}")
             
             # Look for verification indicators in the URL or page
             if "checkpoint" in current_url or "challenge" in current_url or "verify" in current_url:
                 if not verification_warning_shown:
-                    print("\n🔐 VERIFICATION DETECTED 🔐")
-                    print("LinkedIn is asking for additional verification.")
-                    print("Please complete the verification process in the browser window.")
+                    logger.info("\n🔐 VERIFICATION DETECTED 🔐")
+                    logger.info("LinkedIn is asking for additional verification.")
+                    logger.info("Please complete the verification process in the browser window.")
                     verification_warning_shown = True
                     
                 # Show timer for verification
-                print(f"Waiting for verification... ({wait_time} seconds elapsed)")
+                logger.info(f"Waiting for verification... ({wait_time} seconds elapsed)")
                 sleep(check_interval)
                 wait_time += check_interval
                 continue
                 
             # Check if we're on the feed page (successfully logged in)
             if "feed" in current_url or "linkedin.com/feed" in current_url:
-                print("\n✅ LOGIN SUCCESSFUL! You're on the LinkedIn feed.")
+                logger.info("\n✅ LOGIN SUCCESSFUL! You're on the LinkedIn feed.")
                 is_logged_in = True
                 
-                # Now switch to headless mode since we're logged in
-                print("Login successful, now hiding browser window...")
-                if switch_to_headless():
-                    print("Browser window hidden successfully")
-                else:
-                    print("Failed to hide browser window, but login is successful")
+                # Save cookies for future use
+                global cookies_jar
+                cookies_jar = driver.get_cookies()
+                logger.info(f"Saved {len(cookies_jar)} cookies for future use")
                 
-                print("="*80)
-                print("LOGIN PROCESS COMPLETED SUCCESSFULLY")
-                print("="*80 + "\n")
+                # Now switch to headless mode since we're logged in
+                logger.info("Login successful, now hiding browser window...")
+                if switch_to_headless():
+                    logger.info("Browser window hidden successfully")
+                else:
+                    logger.info("Failed to hide browser window, but login is successful")
+                
+                logger.info("="*80)
+                logger.info("LOGIN PROCESS COMPLETED SUCCESSFULLY")
+                logger.info("="*80 + "\n")
                 return True
                     
             # Not on feed yet, but not on an obvious verification page either
-            print(f"Waiting for login to complete... ({wait_time} seconds elapsed)")
+            logger.info(f"Waiting for login to complete... ({wait_time} seconds elapsed)")
             sleep(check_interval)
             wait_time += check_interval
             
         except Exception as e:
-            print(f"Error checking login status: {e}")
+            logger.error(f"Error checking login status: {e}")
             sleep(check_interval)
             wait_time += check_interval
     
     # If we get here, check one more time if we're logged in
     try:
         if driver and ("feed" in driver.current_url or not driver.find_elements(By.ID, 'username')):
-            print("✅ Login successful!")
+            logger.info("✅ Login successful!")
             is_logged_in = True
             
+            # Save cookies for future use
+            cookies_jar = driver.get_cookies()
+            logger.info(f"Saved {len(cookies_jar)} cookies for future use")
+            
             # Now switch to headless mode since we're logged in
-            print("Login successful, now hiding browser window...")
+            logger.info("Login successful, now hiding browser window...")
             if switch_to_headless():
-                print("Browser window hidden successfully")
+                logger.info("Browser window hidden successfully")
             else:
-                print("Failed to hide browser window, but login is successful")
+                logger.info("Failed to hide browser window, but login is successful")
                 
             return True
     except Exception as e:
-        print(f"Error in final login check: {e}")
+        logger.error(f"Error in final login check: {e}")
     
     # If we get here, login timed out or failed
-    print("❌ Timed out or failed waiting for login")
+    logger.error("❌ Timed out or failed waiting for login")
     if driver:
         driver.quit()
         driver = None
@@ -253,39 +313,48 @@ def manual_login():
     return False
 
 def ensure_login():
-    """Check if we're logged in, and if not, initiate manual login"""
-    global driver, is_logged_in
+    """Check if we're logged in, and if not, initiate login"""
+    global driver, is_logged_in, cookies_jar
     
     # Always check driver validity even if logged in
     if is_logged_in and driver:
         try:
             # Test if driver is still responsive
             current_url = driver.current_url
-            print(f"Driver check: Current URL is {current_url}")
+            logger.info(f"Driver check: Current URL is {current_url}")
             # If we get here, driver is still valid
             return True
         except Exception as e:
-            print(f"Driver is no longer valid: {e}")
+            logger.error(f"Driver is no longer valid: {e}")
             is_logged_in = False
             driver = None
     
     # If we get here, either is_logged_in was False or driver was invalid
     try:
-        # We need a new login session
+        # First try cookie login if we have cookies
+        if cookies_jar:
+            logger.info("Attempting login with saved cookies")
+            if cookie_login():
+                return True
+            else:
+                logger.warning("Cookie login failed, falling back to manual login")
+                cookies_jar = None  # Clear invalid cookies
+        
+        # If cookie login failed or no cookies, fall back to manual login
         return manual_login()
     except Exception as e:
-        print(f"Login failed: {str(e)}")
+        logger.error(f"Login failed: {str(e)}")
         return False
 
 def scrape_company_about_page(driver, company_url):
     """Scrape the "About" page of a LinkedIn company"""
     about_url = f"{company_url}/about/"
-    print(f"Navigating to the about page: {about_url}")
+    logger.info(f"Navigating to the about page: {about_url}")
     driver.get(about_url)
     sleep(3)
     
     if "login" in driver.current_url:
-        print("Session expired or not logged in. Cannot scrape about page.")
+        logger.error("Session expired or not logged in. Cannot scrape about page.")
         return {}
     
     about_data = {
@@ -307,9 +376,9 @@ def scrape_company_about_page(driver, company_url):
         description_p = soup.find('p', {'class': 'break-words white-space-pre-wrap t-black--light text-body-medium'})
         if description_p:
             about_data['description'] = description_p.get_text().strip()
-            print(f"Found company description: {about_data['description'][:50]}...")
+            logger.info(f"Found company description: {about_data['description'][:50]}...")
     except Exception as e:
-        print(f"Error extracting company description: {e}")
+        logger.error(f"Error extracting company description: {e}")
     
     try:
         dt_elements = soup.find_all('dt')
@@ -329,7 +398,7 @@ def scrape_company_about_page(driver, company_url):
                 website_link = dd.find('a')
                 if website_link:
                     about_data['website'] = website_link.get_text().strip()
-                    print(f"Found website: {about_data['website']}")
+                    logger.info(f"Found website: {about_data['website']}")
                     
             elif "Phone" in header_text:
                 phone_link = dd.find('a')
@@ -337,58 +406,58 @@ def scrape_company_about_page(driver, company_url):
                     phone_span = phone_link.find('span', {'class': 'link-without-visited-state'})
                     if phone_span:
                         about_data['phone'] = phone_span.get_text().strip()
-                        print(f"Found phone: {about_data['phone']}")
+                        logger.info(f"Found phone: {about_data['phone']}")
                         
             elif "Industry" in header_text:
                 about_data['industry'] = dd.get_text().strip()
-                print(f"Found industry: {about_data['industry']}")
+                logger.info(f"Found industry: {about_data['industry']}")
                 
             elif "Company size" in header_text:
                 size_text = dd.get_text().strip()
                 about_data['company_size'] = size_text
-                print(f"Found company size: {about_data['company_size']}")
+                logger.info(f"Found company size: {about_data['company_size']}")
                 
                 associated_dd = dd.find_next('dd')
                 if associated_dd:
                     associated_link = associated_dd.find('a')
                     if associated_link:
                         about_data['associated_members'] = associated_link.get_text().strip()
-                        print(f"Found associated members: {about_data['associated_members']}")
+                        logger.info(f"Found associated members: {about_data['associated_members']}")
                         
             elif "Headquarters" in header_text:
                 about_data['headquarter'] = dd.get_text().strip()
-                print(f"Found headquarters: {about_data['headquarter']}")
+                logger.info(f"Found headquarters: {about_data['headquarter']}")
                 
             elif "Founded" in header_text:
                 about_data['founded'] = dd.get_text().strip()
-                print(f"Found founded year: {about_data['founded']}")
+                logger.info(f"Found founded year: {about_data['founded']}")
                 
             elif "Specialties" in header_text:
                 about_data['specialties'] = dd.get_text().strip()
-                print(f"Found specialties: {about_data['specialties'][:50]}...")
+                logger.info(f"Found specialties: {about_data['specialties'][:50]}...")
     
     except Exception as e:
-        print(f"Error processing about page structure: {e}")
+        logger.error(f"Error processing about page structure: {e}")
     
     if not about_data['associated_members']:
         try:
             associated_link = soup.find('a', string=lambda t: t and 'associated members' in t.lower())
             if associated_link:
                 about_data['associated_members'] = associated_link.get_text().strip()
-                print(f"Found associated members (direct approach): {about_data['associated_members']}")
+                logger.info(f"Found associated members (direct approach): {about_data['associated_members']}")
         except Exception as e:
-            print(f"Error finding associated members: {e}")
+            logger.error(f"Error finding associated members: {e}")
     
     return about_data
 
 def scrape_company_basics(driver, url):
     """Scrape basic information from a LinkedIn company page"""
     driver.get(url)
-    print(f"Scraping company page: {url}")
+    logger.info(f"Scraping company page: {url}")
     sleep(2)
     
     if "login" in driver.current_url:
-        print("Session expired or not logged in. Cannot scrape.")
+        logger.error("Session expired or not logged in. Cannot scrape.")
         return {"error": "Not logged in", "url": url}
     
     company_data = {
@@ -424,9 +493,9 @@ def scrape_company_basics(driver, url):
         
         if name:
             company_data['name'] = name.get_text().strip()
-            print(f"Found company name: {company_data['name']}")
+            logger.info(f"Found company name: {company_data['name']}")
     except Exception as e:
-        print(f"Error extracting company name: {e}")
+        logger.error(f"Error extracting company name: {e}")
     
     try:
         industry_dt = soup.find('dt', string=lambda t: t and 'Industry' in t)
@@ -434,17 +503,17 @@ def scrape_company_basics(driver, url):
             industry_dd = industry_dt.find_next('dd')
             if industry_dd:
                 company_data['industry'] = industry_dd.get_text().strip()
-                print(f"Found industry from page: {company_data['industry']}")
+                logger.info(f"Found industry from page: {company_data['industry']}")
         
         if not company_data['industry']:
             for class_name in ['org-top-card-summary-info-list__info-item', 'top-card-layout__headline']:
                 industry_elem = soup.find(['div', 'h2', 'span'], {'class': class_name})
                 if industry_elem:
                     company_data['industry'] = industry_elem.get_text().strip()
-                    print(f"Found industry from top card: {company_data['industry']}")
+                    logger.info(f"Found industry from top card: {company_data['industry']}")
                     break
     except Exception as e:
-        print(f"Error extracting company industry: {e}")
+        logger.error(f"Error extracting company industry: {e}")
     
     try:
         hq_dt = soup.find('dt', string=lambda t: t and 'Headquarters' in t)
@@ -452,7 +521,7 @@ def scrape_company_basics(driver, url):
             hq_dd = hq_dt.find_next('dd')
             if hq_dd:
                 company_data['headquarter'] = hq_dd.get_text().strip()
-                print(f"Found headquarters from page: {company_data['headquarter']}")
+                logger.info(f"Found headquarters from page: {company_data['headquarter']}")
         
         if not company_data['headquarter']:
             location_pattern = r'[\w\s-]+,\s+[\w\s-]+'
@@ -462,10 +531,10 @@ def scrape_company_basics(driver, url):
                 text = elem.get_text().strip()
                 if re.search(location_pattern, text) and not text.endswith("followers") and not "industry" in text.lower():
                     company_data['headquarter'] = text
-                    print(f"Found headquarters from pattern match: {company_data['headquarter']}")
+                    logger.info(f"Found headquarters from pattern match: {company_data['headquarter']}")
                     break
     except Exception as e:
-        print(f"Error extracting company headquarters: {e}")
+        logger.error(f"Error extracting company headquarters: {e}")
     
     try:
         size_dt = soup.find('dt', string=lambda t: t and 'Company size' in t)
@@ -473,15 +542,15 @@ def scrape_company_basics(driver, url):
             size_dd = size_dt.find_next('dd')
             if size_dd:
                 company_data['no of employees'] = size_dd.get_text().strip()
-                print(f"Found employee count from page: {company_data['no of employees']}")
+                logger.info(f"Found employee count from page: {company_data['no of employees']}")
         
         if not company_data['no of employees']:
             employee_count_span = soup.find('span', {'class': 't-normal t-black--light link-without-visited-state link-without-hover-state'})
             if employee_count_span and 'employee' in employee_count_span.get_text().lower():
                 company_data['no of employees'] = employee_count_span.get_text().strip()
-                print(f"Found employee count from span: {company_data['no of employees']}")
+                logger.info(f"Found employee count from span: {company_data['no of employees']}")
     except Exception as e:
-        print(f"Error extracting employee count: {e}")
+        logger.error(f"Error extracting employee count: {e}")
     
     about_data = scrape_company_about_page(driver, url)
     
@@ -524,7 +593,7 @@ def extract_profile_data(card):
             return profile_data
         return None
     except Exception as e:
-        print(f"Error in extract_profile_data: {e}")
+        logger.error(f"Error in extract_profile_data: {e}")
         return None
 
 def scroll_and_scrape_people(driver, all_employees):
@@ -532,11 +601,11 @@ def scroll_and_scrape_people(driver, all_employees):
     scroll_count = 0
     consecutive_no_new_profiles = 0
     
-    print("Starting to scrape employee profiles...")
+    logger.info("Starting to scrape employee profiles...")
     
     while True:
         scroll_count += 1
-        print(f"Scroll attempt #{scroll_count}...")
+        logger.info(f"Scroll attempt #{scroll_count}...")
         
         page_source = driver.page_source
         soup = BeautifulSoup(page_source, 'lxml')
@@ -558,10 +627,10 @@ def scroll_and_scrape_people(driver, all_employees):
                     profile_cards.append(li)
         
         if not profile_cards:
-            print("No profile cards found on this page.")
+            logger.info("No profile cards found on this page.")
             break
         
-        print(f"Found {len(profile_cards)} profile cards on this scroll.")
+        logger.info(f"Found {len(profile_cards)} profile cards on this scroll.")
         
         initial_length = len(all_employees)
         for card in profile_cards:
@@ -570,34 +639,34 @@ def scroll_and_scrape_people(driver, all_employees):
                 if profile_data and not any(p.get('url') == profile_data.get('url') for p in all_employees):
                     all_employees.append(profile_data)
                     if len(all_employees) % 10 == 0:
-                        print(f"Collected {len(all_employees)} profiles so far...")
+                        logger.info(f"Collected {len(all_employees)} profiles so far...")
             except Exception as e:
-                print(f"Error extracting profile: {e}")
+                logger.error(f"Error extracting profile: {e}")
         
         new_profiles_found = len(all_employees) - initial_length
-        print(f"Found {new_profiles_found} new profiles in this scroll.")
+        logger.info(f"Found {new_profiles_found} new profiles in this scroll.")
         
         if new_profiles_found == 0:
             consecutive_no_new_profiles += 1
-            print(f"No new profiles found for {consecutive_no_new_profiles} consecutive scrolls.")
+            logger.info(f"No new profiles found for {consecutive_no_new_profiles} consecutive scrolls.")
         else:
             consecutive_no_new_profiles = 0
         
         if consecutive_no_new_profiles >= 3:
-            print("No new profiles for 3 consecutive scrolls. Ending search.")
+            logger.info("No new profiles for 3 consecutive scrolls. Ending search.")
             break
         
         try:
             show_more_button = driver.find_element(By.XPATH, "//button[contains(., 'Show more')]")
             if not show_more_button.is_displayed() or not show_more_button.is_enabled():
-                print("'Show more' button is not clickable. Ending search.")
+                logger.info("'Show more' button is not clickable. Ending search.")
                 break
                 
-            print("Clicking 'Show more' button...")
+            logger.info("Clicking 'Show more' button...")
             driver.execute_script("arguments[0].click();", show_more_button)
             sleep(3)
         except Exception as e:
-            print(f"No 'Show more' button found ({str(e)}). Scrolling down instead.")
+            logger.info(f"No 'Show more' button found ({str(e)}). Scrolling down instead.")
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
             sleep(3)
             
@@ -606,7 +675,7 @@ def scroll_and_scrape_people(driver, all_employees):
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
             sleep(3)
     
-    print(f"Finished scraping people. Found a total of {len(all_employees)} employee profiles.")
+    logger.info(f"Finished scraping people. Found a total of {len(all_employees)} employee profiles.")
 
 def identify_key_personnel(all_employees, company_data):
     """Identify key personnel from employee profiles"""
@@ -621,7 +690,7 @@ def identify_key_personnel(all_employees, company_data):
     
     role_counts = {role: 0 for role in role_keywords}
     
-    print("\nIdentifying key personnel by role...")
+    logger.info("\nIdentifying key personnel by role...")
     for employee in all_employees:
         if "title" in employee and employee["title"]:
             title_lower = employee["title"].lower()
@@ -639,10 +708,10 @@ def identify_key_personnel(all_employees, company_data):
                             role_counts[role] += 1
                         break
                 except Exception as e:
-                    print(f"ERROR: {e}")
+                    logger.error(f"ERROR: {e}")
     
     for role, count in role_counts.items():
-        print(f"Found {count} {role} personnel")
+        logger.info(f"Found {count} {role} personnel")
     
     return role_counts
 
@@ -651,22 +720,22 @@ def scrape_company_people(driver, company_url, company_data):
     # First try the /people/ page
     people_url = f"{company_url}/people/"
     driver.get(people_url)
-    print(f"Navigating to company's people page: {people_url}")
+    logger.info(f"Navigating to company's people page: {people_url}")
     sleep(3)
     
     if "login" in driver.current_url:
-        print("Session expired or not logged in. Cannot scrape people.")
+        logger.error("Session expired or not logged in. Cannot scrape people.")
         return company_data
     
     all_employees = []
     
     # Try to get employee names from the people page
-    print("Attempting to scrape from /people/ page...")
+    logger.info("Attempting to scrape from /people/ page...")
     scroll_and_scrape_people(driver, all_employees)
     
     # If we didn't find any employees, try the main company page as fallback
     if len(all_employees) == 0:
-        print("No employees found on /people/ page. Trying main company page...")
+        logger.info("No employees found on /people/ page. Trying main company page...")
         driver.get(company_url)
         sleep(3)
         
@@ -674,25 +743,25 @@ def scrape_company_people(driver, company_url, company_data):
         try:
             see_all_link = driver.find_element(By.XPATH, "//a[contains(text(), 'See all')]")
             if see_all_link:
-                print("Found 'See all' link. Clicking it...")
+                logger.info("Found 'See all' link. Clicking it...")
                 driver.execute_script("arguments[0].click();", see_all_link)
                 sleep(3)
                 
                 # Now try scraping again
                 scroll_and_scrape_people(driver, all_employees)
         except Exception as e:
-            print(f"Couldn't find 'See all' link: {e}")
+            logger.error(f"Couldn't find 'See all' link: {e}")
     
     # If we still didn't find any employees, try one more approach
     if len(all_employees) == 0:
-        print("Still no employees found. Trying direct search...")
+        logger.info("Still no employees found. Trying direct search...")
         
         # Get company name
         company_name = company_data.get('name', '')
         if company_name:
             search_url = f"https://www.linkedin.com/search/results/people/?keywords={company_name.replace(' ', '%20')}"
             driver.get(search_url)
-            print(f"Searching for employees with company name: {company_name}")
+            logger.info(f"Searching for employees with company name: {company_name}")
             sleep(3)
             
             # Try scraping again
@@ -700,11 +769,11 @@ def scrape_company_people(driver, company_url, company_data):
     
     role_counts = identify_key_personnel(all_employees, company_data)
     
-    print("\nPersonnel Summary:")
-    print(f"Total profiles found: {len(all_employees)}")
+    logger.info("\nPersonnel Summary:")
+    logger.info(f"Total profiles found: {len(all_employees)}")
     for role, count in role_counts.items():
         if count > 0:
-            print(f"- {role}: {count} people")
+            logger.info(f"- {role}: {count} people")
     
     return company_data
 
@@ -714,7 +783,7 @@ def save_to_json(data, filename):
     
     with open(filename, 'w', encoding='utf-8') as f:
         json.dump(data, f, indent=4, ensure_ascii=False)
-    print(f"Data saved to {filename}")
+    logger.info(f"Data saved to {filename}")
 
 def scrape_company(company_url):
     """Scrape a LinkedIn company page and save the data"""
@@ -725,15 +794,15 @@ def scrape_company(company_url):
     
     try:
         if not is_logged_in:
-            print("Not logged in. Attempting to log in...")
+            logger.info("Not logged in. Attempting to log in...")
             if not ensure_login():
                 is_scraping = False
                 current_job = None
                 return {"error": "Failed to log in", "status": "error"}
         
-        print("\n" + "="*80)
-        print(f"STARTING SCRAPE FOR: {company_url}")
-        print("="*80)
+        logger.info("\n" + "="*80)
+        logger.info(f"STARTING SCRAPE FOR: {company_url}")
+        logger.info("="*80)
         
         company_data = scrape_company_basics(driver, company_url)
         
@@ -768,7 +837,7 @@ def scrape_company(company_url):
         
         return result
     except Exception as e:
-        print(f"Error in scrape_company: {e}")
+        logger.error(f"Error in scrape_company: {e}")
         return {
             "status": "error",
             "message": str(e),
@@ -795,7 +864,7 @@ def status():
             "current_job": current_job
         })
     except Exception as e:
-        print(f"Error in status endpoint: {e}")
+        logger.error(f"Error in status endpoint: {e}")
         return jsonify({"error": str(e), "status": "error"})
 
 @app.route('/login', methods=['GET'])
@@ -825,6 +894,80 @@ def login():
             "status": "error",
             "message": f"Error during login: {str(e)}"
         }), 500
+
+# New Remote Login Endpoints
+@app.route('/remote-login', methods=['GET'])
+def remote_login():
+    """Return login URL for frontend to handle login"""
+    global is_logged_in
+    
+    if is_logged_in:
+        return jsonify({
+            "status": "already_logged_in",
+            "message": "Already logged in to LinkedIn"
+        })
+    
+    return jsonify({
+        "status": "ready_for_login",
+        "login_url": "https://www.linkedin.com/login",
+        "message": "Please log in to LinkedIn in your browser, then submit your session cookies."
+    })
+
+@app.route('/submit-session', methods=['POST'])
+def submit_session():
+    """Receive and store LinkedIn cookies from frontend"""
+    global cookies_jar, is_logged_in
+    
+    try:
+        data = request.json
+        if not data or 'cookies' not in data:
+            return jsonify({
+                "status": "error",
+                "message": "No cookies data provided"
+            }), 400
+            
+        cookies = data['cookies']
+        if not cookies or not isinstance(cookies, list) or len(cookies) == 0:
+            return jsonify({
+                "status": "error",
+                "message": "Invalid cookie format"
+            }), 400
+            
+        logger.info(f"Received {len(cookies)} cookies from frontend")
+        
+        # Store the cookies
+        cookies_jar = cookies
+        
+        # Validate the cookies immediately
+        if cookie_login():
+            return jsonify({
+                "status": "success",
+                "message": "Successfully logged in with provided cookies",
+                "verified": True
+            })
+        else:
+            cookies_jar = None
+            return jsonify({
+                "status": "error",
+                "message": "Cookies were received but login failed. Please try again."
+            }), 400
+            
+    except Exception as e:
+        logger.error(f"Error processing submitted session: {e}")
+        return jsonify({
+            "status": "error",
+            "message": f"Error processing cookies: {str(e)}"
+        }), 500
+
+@app.route('/remote-login-check', methods=['GET'])
+def remote_login_check():
+    """Check if remote login was successful"""
+    global is_logged_in
+    
+    return jsonify({
+        "status": "success" if is_logged_in else "not_logged_in",
+        "logged_in": is_logged_in
+    })
 
 @app.route('/company', methods=['GET'])
 def company_endpoint():
@@ -868,13 +1011,13 @@ def company_endpoint():
         
         # Reset state if force=true
         if force and is_scraping:
-            print("Forced scraping requested. Resetting previous scraping job.")
+            logger.info("Forced scraping requested. Resetting previous scraping job.")
             try:
                 if driver:
                     driver.quit()
                     driver = None
             except Exception as e:
-                print(f"Error closing driver during force reset: {e}")
+                logger.error(f"Error closing driver during force reset: {e}")
             finally:
                 is_scraping = False
                 current_job = None
@@ -882,16 +1025,16 @@ def company_endpoint():
         
         try:
             # Make sure we're logged in first
-            print("\n" + "="*80)
-            print(f"STARTING LINKEDIN SCRAPE FOR: {company_url}")
-            print("="*80)
+            logger.info("\n" + "="*80)
+            logger.info(f"STARTING LINKEDIN SCRAPE FOR: {company_url}")
+            logger.info("="*80)
             
             if not is_logged_in or not driver:
-                print("LinkedIn login required before scraping")
-                login_success = manual_login()
+                logger.info("LinkedIn login required before scraping")
+                login_success = ensure_login()  # Use ensure_login which tries cookies first
                 if not login_success:
                     error_msg = "Failed to log in to LinkedIn. Please try running the scraper again."
-                    print(f"ERROR: {error_msg}")
+                    logger.error(f"ERROR: {error_msg}")
                     job_results[company_url] = {
                         "status": "error",
                         "message": error_msg,
@@ -901,7 +1044,7 @@ def company_endpoint():
                     current_job = None
                     return
             else:
-                print("Already logged in, continuing with scraping")
+                logger.info("Already logged in, continuing with scraping")
             
             # Execute the actual scraping
             result = scrape_company(company_url)
@@ -909,45 +1052,33 @@ def company_endpoint():
             # Store the result
             job_results[company_url] = result
             
-            # Delete the JSON file after storing the results
-            if result["status"] == "success" and "file_path" in result:
-                try:
-                    file_path = result["file_path"]
-                    if os.path.exists(file_path):
-                        os.remove(file_path)
-                        print(f"✅ Successfully deleted JSON file: {file_path}")
-                    else:
-                        print(f"Warning: JSON file not found for deletion: {file_path}")
-                except Exception as e:
-                    print(f"Error deleting JSON file: {e}")
-            
             # Print the final result in terminal to confirm completion
-            print("\n" + "="*80)
+            logger.info("\n" + "="*80)
             if result["status"] == "success":
-                print(f"✅ SCRAPING COMPLETED SUCCESSFULLY FOR: {company_url}")
+                logger.info(f"✅ SCRAPING COMPLETED SUCCESSFULLY FOR: {company_url}")
                 
                 # Print summary of results
-                print("\n📋 SUMMARY:")
+                logger.info("\n📋 SUMMARY:")
                 company_data = result["data"]
-                print(f"Company: {company_data.get('name', 'Unknown')}")
-                print(f"Industry: {company_data.get('industry', 'Not found')}")
-                print(f"Location: {company_data.get('headquarter', 'Not found')}")
-                print(f"Size: {company_data.get('company_size', 'Not found')}")
-                print("\nKey Personnel:")
+                logger.info(f"Company: {company_data.get('name', 'Unknown')}")
+                logger.info(f"Industry: {company_data.get('industry', 'Not found')}")
+                logger.info(f"Location: {company_data.get('headquarter', 'Not found')}")
+                logger.info(f"Size: {company_data.get('company_size', 'Not found')}")
+                logger.info("\nKey Personnel:")
                 for role, personnel in company_data["key_personnel"].items():
                     if personnel:
-                        print(f"- {role.title()}: {len(personnel)} found")
+                        logger.info(f"- {role.title()}: {len(personnel)} found")
             else:
-                print(f"❌ SCRAPING FAILED FOR: {company_url}")
-                print(f"Error: {result.get('message', 'Unknown error')}")
+                logger.info(f"❌ SCRAPING FAILED FOR: {company_url}")
+                logger.info(f"Error: {result.get('message', 'Unknown error')}")
             
-            print("="*80)
+            logger.info("="*80)
             
         except Exception as e:
-            print("\n" + "="*80)
-            print(f"ERROR SCRAPING COMPANY: {company_url}")
-            print(f"Error details: {str(e)}")
-            print("="*80)
+            logger.error("\n" + "="*80)
+            logger.error(f"ERROR SCRAPING COMPANY: {company_url}")
+            logger.error(f"Error details: {str(e)}")
+            logger.error("="*80)
             
             # Create error result
             error_result = {
@@ -969,16 +1100,21 @@ def company_endpoint():
                     current_job["duration"] = current_job["end_time"] - current_job["start_time"]
             current_job = None
             
-            print("\n🏁 Scraping job complete.")
-            print("You can close the browser window if you're finished.")
+            logger.info("\n🏁 Scraping job complete.")
+            logger.info("You can close the browser window if you're finished.")
     
     thread = Thread(target=run_scrape)
     thread.daemon = True
     thread.start()
     
+    # Check if remote login is needed
+    login_message = "A browser window will open for you to log in to LinkedIn manually. Please complete any verification steps LinkedIn requires."
+    if not is_logged_in and cookies_jar is None:
+        login_message = "Please log in using the /remote-login endpoint first, then retry this request."
+    
     return jsonify({
         "status": "started",
-        "message": f"Scraping job started for {company_url}. A browser window will open for you to log in to LinkedIn manually. Please complete any verification steps LinkedIn requires.",
+        "message": f"Scraping job started for {company_url}. {login_message}",
         "url": company_url
     })
 
@@ -1002,24 +1138,76 @@ def get_results():
             "status": "success",
             "urls": list(job_results.keys())
         })
+
+@app.route('/company/company', methods=['GET'])
+def get_company_data():
+    """Get the latest company data from file"""
+    try:
+        # Get the most recent data file
+        data_files = [f for f in os.listdir('data') if f.endswith('_data.json')]
+        if not data_files:
+            return jsonify({
+                "status": "error",
+                "message": "No company data files found"
+            }), 404
+            
+        # Sort by modification time (newest first)
+        latest_file = sorted(data_files, 
+                            key=lambda f: os.path.getmtime(os.path.join('data', f)), 
+                            reverse=True)[0]
+        
+        # Read the file
+        with open(os.path.join('data', latest_file), 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            
+        return jsonify({
+            "status": "success",
+            "data": data
+        })
+    except Exception as e:
+        logger.error(f"Error retrieving company data from file: {e}")
+        return jsonify({
+            "status": "error",
+            "message": str(e)
+        }), 500
+
+@app.route('/logs', methods=['GET'])
+def get_logs():
+    """Return the contents of the log file"""
+    try:
+        with open('scraper.log', 'r') as f:
+            log_lines = f.readlines()
+            
+        # Return the last 200 lines by default, or as specified
+        num_lines = request.args.get('lines', 200, type=int)
+        return jsonify({
+            "status": "success", 
+            "logs": log_lines[-num_lines:]
+        })
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": f"Error reading log file: {str(e)}"
+        }), 500
         
 @app.route('/reset', methods=['GET'])
 def reset_scraper():
     """Reset the scraper's state completely"""
-    global is_scraping, is_logged_in, driver, current_job
+    global is_scraping, is_logged_in, driver, current_job, cookies_jar
     
     try:
         # Properly close the driver if it exists
         if driver:
             driver.quit()
     except Exception as e:
-        print(f"Error closing driver during reset: {e}")
+        logger.error(f"Error closing driver during reset: {e}")
     
     # Reset all global variables
     is_scraping = False
     is_logged_in = False
     driver = None
     current_job = None
+    cookies_jar = None
     
     return jsonify({"status": "success", "message": "Scraper state completely reset"})
 
@@ -1053,7 +1241,7 @@ def proxy_salesql():
         # Remove any trailing slashes
         linkedin_url = linkedin_url.rstrip('/')
         
-        print(f"Making SalesQL API request for: {linkedin_url}")
+        logger.info(f"Making SalesQL API request for: {linkedin_url}")
         
         # Make request to SalesQL API with improved error handling
         import requests
@@ -1069,7 +1257,7 @@ def proxy_salesql():
             
             # Try to parse JSON response
             response_data = response.json()
-            print(f"SalesQL API response status code: {response.status_code}")
+            logger.info(f"SalesQL API response status code: {response.status_code}")
             
             # Return the response data
             return jsonify(response_data)
@@ -1078,7 +1266,7 @@ def proxy_salesql():
             status_code = getattr(http_err.response, 'status_code', 500)
             error_message = f"HTTP error from SalesQL API: {http_err}"
             
-            print(f"SalesQL API HTTP error: {status_code} - {error_message}")
+            logger.error(f"SalesQL API HTTP error: {status_code} - {error_message}")
             
             return jsonify({
                 "status": "error",
@@ -1088,7 +1276,7 @@ def proxy_salesql():
             
         except requests.exceptions.RequestException as req_err:
             error_type = type(req_err).__name__
-            print(f"SalesQL API request error ({error_type}): {req_err}")
+            logger.error(f"SalesQL API request error ({error_type}): {req_err}")
             
             return jsonify({
                 "status": "error",
@@ -1096,7 +1284,7 @@ def proxy_salesql():
             }), 200
             
         except ValueError as json_err:
-            print(f"SalesQL API JSON parsing error: {json_err}")
+            logger.error(f"SalesQL API JSON parsing error: {json_err}")
             
             # If we reach this point, the request succeeded but returned invalid JSON
             # Try to get the raw response text
@@ -1109,7 +1297,7 @@ def proxy_salesql():
             }), 200
             
     except Exception as e:
-        print(f"Error proxying SalesQL request: {e}")
+        logger.error(f"Error proxying SalesQL request: {e}")
         return jsonify({
             "status": "error",
             "message": f"Failed to proxy SalesQL request: {str(e)}"
@@ -1136,10 +1324,10 @@ if __name__ == '__main__':
                 f.write("<html><body><h1>LinkedIn Company Scraper</h1><p>Use the API endpoints to interact with the scraper.</p></body></html>")
         
         # Start the Flask server
-        print("Starting LinkedIn Company Scraper...")
-        print("Access the web interface via API endpoints at http://localhost:5003")
+        logger.info("Starting LinkedIn Company Scraper...")
+        logger.info("Access the web interface via API endpoints at http://localhost:5003")
         app.run(host='0.0.0.0', port=5003, debug=True)
     except KeyboardInterrupt:
-        print("\nShutting down the server...")
+        logger.info("\nShutting down the server...")
         if driver:
             driver.quit()
