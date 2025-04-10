@@ -168,7 +168,7 @@ def manual_login():
     # Display the remote debugging URL prominently
     print("\n" + "="*80)
     print("🌐 REMOTE ACCESS INSTRUCTIONS 🌐")
-    print(f"Open this URL in your browser: http://{74.225.249.58}:9222")
+    print(f"Open this URL in your browser: http://74.225.249.58:9222")
     print("Then click on the '_blank' or 'LinkedIn Login' link to access the login page")
     print("="*80 + "\n")
     
@@ -200,7 +200,7 @@ def manual_login():
     while wait_time < max_wait_time:
         # Show periodic reminders about remote debugging URL
         if wait_time - last_reminder >= reminder_interval:
-            print(f"\nREMINDER: Remote debugging available at http://{74.225.249.58}:9222")
+            print(f"\nREMINDER: Remote debugging available at http://74.225.249.58:9222")
             last_reminder = wait_time
             
         # Check if we're logged in
@@ -214,7 +214,7 @@ def manual_login():
                     print("\n🔐 VERIFICATION DETECTED 🔐")
                     print("LinkedIn is asking for additional verification.")
                     print("Please complete the verification process in the remote browser.")
-                    print(f"Remote browser access: http://{74.225.249.58}:9222")
+                    print(f"Remote browser access: http://74.225.249.58:9222")
                     verification_warning_shown = True
                     
                 # Show timer for verification
@@ -247,7 +247,7 @@ def manual_login():
             
         except Exception as e:
             print(f"Error checking login status: {e}")
-            print(f"You can still access the browser at http://{74.225.249.58}:9222")
+            print(f"You can still access the browser at http://74.225.249.58:9222")
             sleep(check_interval)
             wait_time += check_interval
     
@@ -267,11 +267,11 @@ def manual_login():
             return True
     except Exception as e:
         print(f"Error in final login check: {e}")
-        print(f"You can still access the browser at http://{74.225.249.58}:9222")
+        print(f"You can still access the browser at http://74.225.249.58:9222")
     
     # If we get here, login timed out or failed
     print("❌ Timed out or failed waiting for login")
-    print(f"You can still try accessing the browser manually at http://{74.225.249.58}:9222")
+    print(f"You can still try accessing the browser manually at http://74.225.249.58:9222")
     if driver:
         driver.quit()
         driver = None
