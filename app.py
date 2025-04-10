@@ -2,18 +2,20 @@ import os
 import json
 import re
 import time
+import pickle
+import requests
 from time import sleep
 from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
-from selenium.common.exceptions import NoSuchElementException, WebDriverException
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import NoSuchElementException, WebDriverException, TimeoutException
 from flask import Flask, request, jsonify, send_from_directory
 from threading import Thread
 from flask_cors import CORS
-from flask import Flask, request, jsonify, send_from_directory
 import platform
-import webbrowser
 
 app = Flask(__name__, static_folder="static")
 CORS(app)  # Enable CORS for all routes
@@ -24,6 +26,13 @@ is_logged_in = False
 is_scraping = False
 current_job = None
 job_results = {}
+
+# Configuration for LinkedIn credentials and cookies
+LINKEDIN_USERNAME = "prince0862gupta@gmail.com"  # Replace with your LinkedIn email
+LINKEDIN_PASSWORD = "Prince297#"  # Replace with your LinkedIn password
+COOKIES_FILE = "linkedin_cookies.pkl"
+USE_2CAPTCHA = True  # Set to False if you don't want to use 2Captcha
+CAPTCHA_API_KEY = "your_2captcha_api_key"  # Replace with your 2Captcha API key
 
 def setup_driver(headless=False):
     """Set up and return a WebDriver instance for any available browser"""
@@ -40,7 +49,9 @@ def setup_driver(headless=False):
         "no_sandbox": "--no-sandbox",
         "disable_dev_shm": "--disable-dev-shm-usage",
         "headless": "--headless" if headless else None,
-        "disable_gpu": "--disable-gpu" if headless else None
+        "disable_gpu": "--disable-gpu" if headless else None,
+        "disable_blink_features": "--disable-blink-features=AutomationControlled",  # Hide automation
+        "user_agent": "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.110 Safari/537.36"
     }
     
     # List of browsers to try, in order of preference
@@ -59,31 +70,39 @@ def setup_driver(headless=False):
             
             if browser_name == "chrome":
                 options = webdriver.ChromeOptions()
-                options.add_argument("--remote-debugging-port=9222")
                 for arg in browser_options.values():
                     if arg:
                         options.add_argument(arg)
+                # Add experimental options to avoid detection
+                options.add_experimental_option("excludeSwitches", ["enable-automation"])
+                options.add_experimental_option('useAutomationExtension', False)
                 driver = webdriver.Chrome(options=options)
+                # Execute CDP commands to avoid detection
+                driver.execute_cdp_cmd('Network.setUserAgentOverride', {"userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.110 Safari/537.36"})
+                driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
             
             elif browser_name == "firefox":
                 options = webdriver.FirefoxOptions()
-                options.add_argument("--remote-debugging-port=9222")
                 if browser_options["headless"]:
                     options.add_argument("-headless")
+                # Set Firefox profile settings to avoid detection
+                options.set_preference("dom.webdriver.enabled", False)
+                options.set_preference("useAutomationExtension", False)
                 driver = webdriver.Firefox(options=options)
             
             elif browser_name == "edge":
                 options = webdriver.EdgeOptions()
-                options.add_argument("--remote-debugging-port=9222")
                 for arg in browser_options.values():
                     if arg:
                         options.add_argument(arg)
+                # Add experimental options to avoid detection
+                options.add_experimental_option("excludeSwitches", ["enable-automation"])
+                options.add_experimental_option('useAutomationExtension', False)
                 driver = webdriver.Edge(options=options)
             
             elif browser_name == "safari" and system == "Darwin":
                 # Safari doesn't support headless mode
                 driver = webdriver.Safari()
-                options.add_argument("--remote-debugging-port=9222")
             
             else:
                 continue  # Skip unsupported browsers
@@ -96,6 +115,276 @@ def setup_driver(headless=False):
     
     # If we get here, no browser was available
     raise Exception("No compatible browser found. Please ensure Chrome, Firefox, Edge, or Safari is installed with the corresponding WebDriver.")
+
+def save_cookies(driver, filename=COOKIES_FILE):
+    """Save browser cookies to a file"""
+    if driver:
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(filename)), exist_ok=True)
+            pickle.dump(driver.get_cookies(), open(filename, "wb"))
+            print(f"Cookies saved to {filename}")
+            return True
+        except Exception as e:
+            print(f"Error saving cookies: {e}")
+    return False
+
+def load_cookies(driver, filename=COOKIES_FILE):
+    """Load cookies from file and add them to the browser session"""
+    if not os.path.exists(filename):
+        print(f"Cookie file {filename} not found")
+        return False
+    
+    try:
+        cookies = pickle.load(open(filename, "rb"))
+        
+        # Make sure we're on linkedin.com domain before adding cookies
+        current_url = driver.current_url
+        if "linkedin.com" not in current_url:
+            driver.get("https://www.linkedin.com")
+            sleep(2)
+            
+        # Add cookies to browser
+        for cookie in cookies:
+            try:
+                # Skip cookies that might cause issues
+                if 'expiry' in cookie:
+                    # Convert from seconds to milliseconds
+                    expiry = cookie['expiry']
+                    if isinstance(expiry, int):
+                        cookie['expiry'] = expiry
+                    
+                driver.add_cookie(cookie)
+            except Exception as e:
+                print(f"Error adding cookie {cookie.get('name')}: {e}")
+                
+        print("Cookies loaded successfully")
+        return True
+    except Exception as e:
+        print(f"Error loading cookies: {e}")
+        return False
+
+def solve_captcha_2captcha(driver, api_key):
+    """Attempt to solve CAPTCHA using 2Captcha service"""
+    try:
+        # Find the reCAPTCHA element 
+        iframe = WebDriverWait(driver, 5).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "iframe[title*='recaptcha'], iframe[src*='recaptcha']"))
+        )
+        
+        if not iframe:
+            print("No CAPTCHA iframe found")
+            return False
+            
+        # Get the site key from the iframe src
+        iframe_src = iframe.get_attribute('src')
+        site_key_match = re.search(r'k=([^&]+)', iframe_src)
+        
+        if not site_key_match:
+            print("Could not find site key in iframe src")
+            return False
+            
+        site_key = site_key_match.group(1)
+        page_url = driver.current_url
+        
+        print(f"Found reCAPTCHA with site key: {site_key}")
+        print(f"Sending CAPTCHA to 2Captcha for solving (this may take 10-30 seconds)...")
+        
+        # Submit the CAPTCHA to 2Captcha
+        url = f"https://2captcha.com/in.php?key={api_key}&method=userrecaptcha&googlekey={site_key}&pageurl={page_url}&json=1"
+        response = requests.get(url)
+        response_data = response.json()
+        
+        if response_data['status'] != 1:
+            print(f"2Captcha submission error: {response_data['request']}")
+            return False
+            
+        # Get the request ID
+        request_id = response_data['request']
+        
+        # Poll for the result
+        url = f"https://2captcha.com/res.php?key={api_key}&action=get&id={request_id}&json=1"
+        
+        # Wait for the CAPTCHA to be solved (up to 60 seconds)
+        max_attempts = 30
+        for attempt in range(max_attempts):
+            sleep(2)  # Wait 2 seconds between polls
+            response = requests.get(url)
+            response_data = response.json()
+            
+            if response_data['status'] == 1:
+                # We have the solution
+                g_recaptcha_response = response_data['request']
+                
+                # Execute JavaScript to set the CAPTCHA response
+                driver.execute_script(f'document.getElementById("g-recaptcha-response").innerHTML="{g_recaptcha_response}";')
+                
+                # Also try the callback approach
+                driver.execute_script("___grecaptcha_cfg.clients[0].R.R.callback('" + g_recaptcha_response + "');")
+                
+                print("CAPTCHA solved successfully!")
+                return True
+                
+            if response_data['request'] != 'CAPCHA_NOT_READY':
+                print(f"2Captcha error: {response_data['request']}")
+                return False
+                
+            print(f"Waiting for CAPTCHA solution... ({attempt+1}/{max_attempts})")
+            
+        print("Timed out waiting for CAPTCHA solution")
+        return False
+        
+    except Exception as e:
+        print(f"Error solving CAPTCHA: {e}")
+        return False
+
+def is_captcha_present(driver):
+    """Check if a CAPTCHA is present on the page"""
+    try:
+        # Look for common CAPTCHA elements
+        captcha_elements = driver.find_elements(By.CSS_SELECTOR, 
+            "iframe[title*='recaptcha'], iframe[src*='recaptcha'], div.g-recaptcha, #captcha, .captcha, div[class*='captcha']")
+        
+        return len(captcha_elements) > 0
+    except:
+        return False
+
+def check_login_status(driver):
+    """Check if we're logged in to LinkedIn"""
+    try:
+        # Try to find elements that would indicate we're logged in
+        feed_elements = driver.find_elements(By.ID, "global-nav")
+        login_elements = driver.find_elements(By.ID, "username")
+        
+        # If we're on the feed or don't see login form, we're probably logged in
+        return len(feed_elements) > 0 or len(login_elements) == 0
+    except Exception as e:
+        print(f"Error checking login status: {e}")
+        return False
+
+def auto_login(username=LINKEDIN_USERNAME, password=LINKEDIN_PASSWORD, use_cookies=True):
+    """Automated login to LinkedIn using credentials and optional CAPTCHA solving"""
+    global driver, is_logged_in
+    
+    print("\n" + "="*80)
+    print("STARTING LINKEDIN AUTO LOGIN PROCESS")
+    print("="*80)
+    
+    # Create a visible browser window
+    driver = setup_driver(headless=False)  # Start visible for login, will go headless later
+    driver.get('https://www.linkedin.com/login')
+    print(f"Current page title: {driver.title}")
+    
+    # Try to load cookies first if enabled
+    if use_cookies and load_cookies(driver):
+        # Refresh the page to apply cookies
+        driver.get('https://www.linkedin.com/feed/')
+        sleep(3)
+        
+        # Check if we're logged in
+        if check_login_status(driver):
+            print("✅ Successfully logged in using saved cookies!")
+            is_logged_in = True
+            
+            # Switch to headless mode
+            if switch_to_headless():
+                print("Browser window hidden successfully")
+            
+            print("="*80)
+            print("LOGIN PROCESS COMPLETED SUCCESSFULLY")
+            print("="*80 + "\n")
+            return True
+        else:
+            print("Cookies didn't work for login, trying with credentials...")
+    
+    # If we get here, cookies didn't work or weren't used, proceed with credentials
+    try:
+        print("Attempting login with credentials...")
+        
+        # Clear any existing inputs
+        driver.find_element(By.ID, "username").clear()
+        driver.find_element(By.ID, "password").clear()
+        
+        # Enter credentials
+        driver.find_element(By.ID, "username").send_keys(username)
+        driver.find_element(By.ID, "password").send_keys(password)
+        
+        # Click the sign-in button
+        driver.find_element(By.CSS_SELECTOR, "button[type='submit']").click()
+        print("Login credentials submitted")
+        
+        # Wait for possible challenges (like CAPTCHA or verification)
+        waiting_start_time = time.time()
+        max_wait_time = 60  # 1 minute max wait
+        
+        while time.time() - waiting_start_time < max_wait_time:
+            # If we're on the feed, we're logged in
+            if "feed" in driver.current_url:
+                break
+                
+            # Check for CAPTCHA
+            if is_captcha_present(driver):
+                print("CAPTCHA detected! Attempting to solve...")
+                
+                if USE_2CAPTCHA and CAPTCHA_API_KEY:
+                    if solve_captcha_2captcha(driver, CAPTCHA_API_KEY):
+                        # Wait for redirect after CAPTCHA
+                        sleep(5)
+                    else:
+                        print("⚠️ Automated CAPTCHA solving failed")
+                else:
+                    print("⚠️ CAPTCHA detected but automated solving is disabled")
+                    print("Please solve the CAPTCHA manually within 60 seconds...")
+                    # Give user time to solve it manually if automated solving is disabled
+                    sleep(60)
+            
+            # Check for two-factor auth
+            two_factor_elements = driver.find_elements(By.CSS_SELECTOR, 
+                "input[id*='verification'], input[id*='pin'], input[id*='code'], div[contains(text(), 'Two-step')]")
+            
+            if two_factor_elements:
+                print("⚠️ Two-factor authentication detected!")
+                print("Please complete the verification manually.")
+                # Give user time to complete 2FA
+                sleep(30)
+            
+            # Check if we're logged in after each iteration
+            if check_login_status(driver):
+                break
+                
+            # Small wait before checking again
+            sleep(2)
+        
+        # Final check if we're logged in
+        if check_login_status(driver):
+            print("✅ Login successful!")
+            is_logged_in = True
+            
+            # Save cookies for future use
+            save_cookies(driver)
+            
+            # Switch to headless mode
+            if switch_to_headless():
+                print("Browser window hidden successfully")
+            
+            print("="*80)
+            print("LOGIN PROCESS COMPLETED SUCCESSFULLY")
+            print("="*80 + "\n")
+            return True
+        else:
+            print("❌ Login failed after attempts")
+            is_logged_in = False
+            if driver:
+                driver.quit()
+                driver = None
+            return False
+            
+    except Exception as e:
+        print(f"Error during login process: {e}")
+        is_logged_in = False
+        if driver:
+            driver.quit()
+            driver = None
+        return False
 
 def switch_to_headless():
     """Switch the current visible Chrome driver to headless mode"""
@@ -151,135 +440,8 @@ def switch_to_headless():
         print(f"Error switching to headless mode: {e}")
         return False
 
-def manual_login():
-    """Present a browser window for the user to manually log in to LinkedIn with verification guidance"""
-    global driver, is_logged_in
-    
-    print("\n" + "="*80)
-    print("STARTING LINKEDIN MANUAL LOGIN PROCESS")
-    print("="*80)
-    
-    print("Opening browser for manual login...")
-    
-    # Create a visible browser window
-    driver = setup_driver(headless=False)
-    driver.get('https://www.linkedin.com/login')
-    
-    # Display the remote debugging URL prominently
-    print("\n" + "="*80)
-    print("🌐 REMOTE ACCESS INSTRUCTIONS 🌐")
-    print(f"Open this URL in your browser: http://74.225.249.58:9222")
-    print("Then click on the '_blank' or 'LinkedIn Login' link to access the login page")
-    print("="*80 + "\n")
-    
-    print(f"Current page title: {driver.title}")
-    
-    # Display clear instructions for the user
-    print("\n📱 LINKEDIN LOGIN & VERIFICATION GUIDE 📱")
-    print("1. Enter your LinkedIn credentials in the remote browser window.")
-    print("2. LinkedIn may ask for additional verification via:")
-    print("   - Email code")
-    print("   - SMS code")
-    print("   - LinkedIn mobile app approval")
-    print("3. Complete ALL verification steps until you see your LinkedIn feed.")
-    print("4. DO NOT close the browser window.")
-    
-    # Wait for user confirmation before proceeding
-    print("\n⚠️ IMPORTANT: DO NOT CONTINUE UNTIL VERIFICATION IS COMPLETE ⚠️")
-    
-    # Wait for the user to log in manually (up to 5 minutes)
-    wait_time = 0
-    max_wait_time = 300  # 5 minutes
-    check_interval = 3  # Check every 3 seconds
-    verification_warning_shown = False
-    
-    # Periodically remind user about the remote debugging URL
-    reminder_interval = 60  # Show reminder every 60 seconds
-    last_reminder = 0
-    
-    while wait_time < max_wait_time:
-        # Show periodic reminders about remote debugging URL
-        if wait_time - last_reminder >= reminder_interval:
-            print(f"\nREMINDER: Remote debugging available at http://74.225.249.58:9222")
-            last_reminder = wait_time
-            
-        # Check if we're logged in
-        try:
-            current_url = driver.current_url
-            print(f"Current URL: {current_url}")
-            
-            # Look for verification indicators in the URL or page
-            if "checkpoint" in current_url or "challenge" in current_url or "verify" in current_url:
-                if not verification_warning_shown:
-                    print("\n🔐 VERIFICATION DETECTED 🔐")
-                    print("LinkedIn is asking for additional verification.")
-                    print("Please complete the verification process in the remote browser.")
-                    print(f"Remote browser access: http://74.225.249.58:9222")
-                    verification_warning_shown = True
-                    
-                # Show timer for verification
-                print(f"Waiting for verification... ({wait_time} seconds elapsed)")
-                sleep(check_interval)
-                wait_time += check_interval
-                continue
-                
-            # Check if we're on the feed page (successfully logged in)
-            if "feed" in current_url or "linkedin.com/feed" in current_url:
-                print("\n✅ LOGIN SUCCESSFUL! You're on the LinkedIn feed.")
-                is_logged_in = True
-                
-                # Now switch to headless mode since we're logged in
-                print("Login successful, now hiding browser window...")
-                if switch_to_headless():
-                    print("Browser window hidden successfully")
-                else:
-                    print("Failed to hide browser window, but login is successful")
-                
-                print("="*80)
-                print("LOGIN PROCESS COMPLETED SUCCESSFULLY")
-                print("="*80 + "\n")
-                return True
-                    
-            # Not on feed yet, but not on an obvious verification page either
-            print(f"Waiting for login to complete... ({wait_time} seconds elapsed)")
-            sleep(check_interval)
-            wait_time += check_interval
-            
-        except Exception as e:
-            print(f"Error checking login status: {e}")
-            print(f"You can still access the browser at http://74.225.249.58:9222")
-            sleep(check_interval)
-            wait_time += check_interval
-    
-    # If we get here, check one more time if we're logged in
-    try:
-        if driver and ("feed" in driver.current_url or not driver.find_elements(By.ID, 'username')):
-            print("✅ Login successful!")
-            is_logged_in = True
-            
-            # Now switch to headless mode since we're logged in
-            print("Login successful, now hiding browser window...")
-            if switch_to_headless():
-                print("Browser window hidden successfully")
-            else:
-                print("Failed to hide browser window, but login is successful")
-                
-            return True
-    except Exception as e:
-        print(f"Error in final login check: {e}")
-        print(f"You can still access the browser at http://74.225.249.58:9222")
-    
-    # If we get here, login timed out or failed
-    print("❌ Timed out or failed waiting for login")
-    print(f"You can still try accessing the browser manually at http://74.225.249.58:9222")
-    if driver:
-        driver.quit()
-        driver = None
-    is_logged_in = False
-    return False
-
 def ensure_login():
-    """Check if we're logged in, and if not, initiate manual login"""
+    """Check if we're logged in, and if not, initiate auto login"""
     global driver, is_logged_in
     
     # Always check driver validity even if logged in
@@ -288,8 +450,13 @@ def ensure_login():
             # Test if driver is still responsive
             current_url = driver.current_url
             print(f"Driver check: Current URL is {current_url}")
-            # If we get here, driver is still valid
-            return True
+            
+            # Check if we're still logged in
+            if check_login_status(driver):
+                return True
+            else:
+                print("Session expired, need to log in again")
+                is_logged_in = False
         except Exception as e:
             print(f"Driver is no longer valid: {e}")
             is_logged_in = False
@@ -298,10 +465,13 @@ def ensure_login():
     # If we get here, either is_logged_in was False or driver was invalid
     try:
         # We need a new login session
-        return manual_login()
+        return auto_login()
     except Exception as e:
         print(f"Login failed: {str(e)}")
         return False
+
+# The rest of the functions remain the same as in the original code
+# Only change the calls from manual_login() to auto_login()
 
 def scrape_company_about_page(driver, company_url):
     """Scrape the "About" page of a LinkedIn company"""
@@ -805,18 +975,7 @@ def scrape_company(company_url):
         is_scraping = False
         current_job = None
 
-# Add this function to open a URL in the default browser
-def open_browser_url(url):
-    """Open a URL in the default web browser"""
-    try:
-        print(f"Attempting to open URL in browser: {url}")
-        webbrowser.open(url)
-        return True
-    except Exception as e:
-        print(f"Error opening browser: {e}")
-        return False
-
-# API Routes
+# API Routes - Only modify the login endpoint
 @app.route('/status', methods=['GET'])
 def status():
     """Check current scraping status"""
@@ -837,7 +996,7 @@ def status():
 
 @app.route('/login', methods=['GET'])
 def login():
-    """Manual login endpoint"""
+    """Auto login endpoint"""
     global is_logged_in, driver
     
     if is_logged_in:
@@ -847,7 +1006,7 @@ def login():
         })
     
     try:
-        if manual_login():
+        if auto_login():
             return jsonify({
                 "status": "success",
                 "message": "Successfully logged in to LinkedIn"
@@ -925,14 +1084,7 @@ def company_endpoint():
             
             if not is_logged_in or not driver:
                 print("LinkedIn login required before scraping")
-                
-                # Open the remote debugging URL before starting the login process
-                vm_ip = "74.225.249.58"  # Hardcoded VM IP address
-                debugging_url = f"http://{vm_ip}:9222"
-                print(f"Opening remote debugging URL: {debugging_url}")
-                open_browser_url(debugging_url)
-                
-                login_success = manual_login()
+                login_success = auto_login()
                 if not login_success:
                     error_msg = "Failed to log in to LinkedIn. Please try running the scraper again."
                     print(f"ERROR: {error_msg}")
@@ -1022,7 +1174,7 @@ def company_endpoint():
     
     return jsonify({
         "status": "started",
-        "message": f"Scraping job started for {company_url}. A browser window will open for you to log in to LinkedIn manually. Please complete any verification steps LinkedIn requires.",
+        "message": f"Scraping job started for {company_url}. The system will attempt to log in automatically using saved credentials.",
         "url": company_url
     })
 
